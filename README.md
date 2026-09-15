@@ -41,6 +41,7 @@ There is also a `/subagent <agent> <task>` command for spawning directly.
 ```typescript
 subagent({ agent: "scout", task: "Analyze the auth module" });
 subagent({ agent: "worker", name: "dark-mode", task: "Implement the dark mode toggle" });
+subagent({ agent: "researcher", model: "openrouter/deepseek/deepseek-v4-flash-0731", thinking: "low", task: "Compare vector DBs" });
 ```
 
 | Parameter | Type | Default | Description |
@@ -48,8 +49,27 @@ subagent({ agent: "worker", name: "dark-mode", task: "Implement the dark mode to
 | `agent` | string | required | Which agent to spawn (must be known and permitted) |
 | `task` | string | required | Task prompt |
 | `name` | string | agent name | Display name for the pane and widget. Must be unique — duplicates are auto-suffixed (`scout`, `scout-2`, …) |
-| `model` | string | agent's model | Override the model for this spawn |
+| `model` | string | first allowlist entry | Model override, in `provider/id` format. Must be in the subagent model allowlist (see below) |
+| `thinking` | string | `medium` | Thinking level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Must be supported by the chosen model per the provider catalog; an unsupported explicit level is rejected, while the default is clamped to the nearest supported level |
 | `cwd` | string | agent's `cwd` | Working directory (see [Role folders](#role-folders)) |
+
+### Subagent model allowlist
+
+Subagents can only run on models in a managed allowlist, seeded with
+`openrouter/z-ai/glm-5.3-flash` and `openrouter/deepseek/deepseek-v4-flash-0731`
+and persisted at `~/.pi/agent/subagent-models.json`. Manage it with the
+`/subagent-models` command:
+
+- `/subagent-models add <provider/id>` — add a model; the argument autocompletes
+  against the live provider catalog (the same source as the `/model` picker), and
+  unknown models are rejected with closest matches
+- `/subagent-models remove <provider/id>` — remove a model (the last remaining
+  entry cannot be removed)
+- `/subagent-models list` — show the allowlist; the first entry is the default
+  used when a spawn omits `model`
+
+`subagents_list` includes the current allowlist in its output so the main agent
+knows which `model`/`thinking` pairs it can request.
 
 ### Messaging
 
@@ -76,11 +96,11 @@ If the reply arrives while the sub-agent is still mid-turn, it is absorbed into 
 
 | Agent | Model | Tools | Role |
 | ----- | ----- | ----- | ---- |
-| **scout** | `openrouter/z-ai/glm-5.3` | `read`, `grep`, `find`, `ls` | Fast read-only codebase recon |
-| **researcher** | `openrouter/z-ai/glm-5.3` | `web_search`, `web_fetch`, `safe_bash` | Web research, synthesized into a sourced brief |
-| **worker** | `openrouter/z-ai/glm-5.3` | `read`, `write`, `edit`, `bash`, `web_search`, `web_fetch` + spawning | General implementer; may spawn `scout` and `researcher` |
+| **scout** | subagent model list | `read`, `grep`, `find`, `ls` | Fast read-only codebase recon |
+| **researcher** | subagent model list | `web_search`, `web_fetch`, `safe_bash` | Web research, synthesized into a sourced brief |
+| **worker** | subagent model list | `read`, `write`, `edit`, `bash`, `web_search`, `web_fetch` + spawning | General implementer; may spawn `scout` and `researcher` |
 
-All three are autonomous (`auto-exit: true`) and carry their identity in the system prompt (`system-prompt: append`).
+All three are autonomous (`auto-exit: true`) and carry their identity in the system prompt (`system-prompt: append`). Their model and thinking level are **not** fixed in frontmatter — the spawn params decide, defaulting to the first subagent model allowlist entry at thinking level `medium` (clamped to the model's capabilities).
 
 ## Custom agents
 
@@ -90,7 +110,7 @@ Place a `.md` file in `.pi/agents/` (project) or `~/.pi/agent/agents/` (global).
 ---
 name: my-agent
 description: Does something specific
-model: openrouter/z-ai/glm-5.3
+model: openrouter/z-ai/glm-5.3-flash
 thinking: medium
 tools: read, edit, write, safe_bash, web_search
 session-mode: lineage-only
@@ -106,8 +126,8 @@ You are a specialized agent that does X...
 | ----- | ---- | ----------- |
 | `name` | string | Agent name (used in `agent: "my-agent"`) |
 | `description` | string | Shown in `subagents_list` |
-| `model` | string | Default model |
-| `thinking` | string | `minimal`, `low`, `medium`, or `high` |
+| `model` | string | Optional fallback model; spawns default to the first subagent model allowlist entry when neither the spawn params nor frontmatter specify one |
+| `thinking` | string | Optional fallback thinking level: `minimal`, `low`, `medium`, or `high`; spawns default to `medium` (clamped) when unset |
 | `tools` | string | Strict tool allowlist. Built-ins: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`. Extension-backed: `web_search`, `web_fetch`, `safe_bash`, `video_extract`, `youtube_search`, `google_image_search`. Only the extensions backing the listed tools are loaded into the child |
 | `subagent_agents` | string | Comma-separated agent names this agent may spawn. **Presence of this field grants the spawning toolset** (`subagent`, `subagent_message`, `subagents_list`) and restricts spawn targets to the list. Omit it and the agent cannot spawn at all |
 | `skills` | string | Comma-separated skill names to auto-load |

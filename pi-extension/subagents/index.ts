@@ -42,6 +42,15 @@ import {
   type SubagentLoadout,
 } from "./session.ts";
 import {
+  addModelToAllowlist,
+  getModelAllowlistPath,
+  parseModelEntry,
+  readModelAllowlist,
+  removeModelFromAllowlist,
+  resolveSubagentModel,
+  type ModelRegistryLike,
+} from "./models.ts";
+import {
   type StatusSnapshot,
   type SubagentStatusState,
   advanceStatusState,
@@ -105,7 +114,22 @@ const SubagentParams = Type.Object({
         "Has no effect on which agent runs — use `agent` for that.",
     }),
   ),
-  model: Type.Optional(Type.String({ description: "Model override (overrides agent default)" })),
+  model: Type.Optional(
+    Type.String({
+      description:
+        "Model for this subagent, in provider/id format (e.g. openrouter/z-ai/glm-5.3-flash). " +
+        "Must be in the subagent model allowlist (see subagents_list for the current list). " +
+        "Omit to use the agent's default model, or the first allowlist entry when the agent has none.",
+    }),
+  ),
+  thinking: Type.Optional(
+    Type.String({
+      description:
+        "Thinking level for this subagent: off, minimal, low, medium, high, xhigh, or max. " +
+        "Must be supported by the chosen model per the provider catalog. " +
+        "Omit to let the default (medium) be clamped to the model's nearest supported level.",
+    }),
+  ),
   cwd: Type.Optional(
     Type.String({
       description:
@@ -1177,7 +1201,7 @@ async function launchSubagent(
   const effectiveModel = params.model ?? agentDefs?.model;
   const effectiveTools = agentDefs?.tools;
   const effectiveSkills = agentDefs?.skills;
-  const effectiveThinking = agentDefs?.thinking;
+  const effectiveThinking = params.thinking ?? agentDefs?.thinking;
   const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
 
   const sessionFile = ctx.sessionManager.getSessionFile();
@@ -1758,6 +1782,26 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
+        // Resolve + validate the spawn's model and thinking level against the
+        // subagent model allowlist and the provider catalog. A rejected pair
+        // returns an informative error so the caller can retry with a valid one.
+        const spawnAgentDefs = loadAgentDefaults(params.agent);
+        const resolution = resolveSubagentModel({
+          requestedModel: params.model ?? null,
+          requestedThinking: params.thinking ?? null,
+          agentModel: spawnAgentDefs?.model ?? null,
+          agentThinking: spawnAgentDefs?.thinking ?? null,
+          registry: (latestCtx as any)?.modelRegistry as ModelRegistryLike | undefined ?? null,
+        });
+        if (!resolution.ok) {
+          return {
+            content: [{ type: "text", text: resolution.error }],
+            details: { error: "model/thinking rejected" },
+          };
+        }
+        params.model = resolution.model;
+        params.thinking = resolution.thinking;
+
         // Validate prerequisites (need mux + a session file to derive the
         // artifact dir that hosts this session's name registry).
         if (!isMuxAvailable()) {
@@ -1980,9 +2024,18 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           return `• ${a.name}${badge}${model}${desc}`;
         });
 
+        // Surface the subagent model allowlist so the caller knows which
+        // models it may pass to subagent({ model }) — first entry is the default.
+        const allowlist = readModelAllowlist();
+        const allowlistLines = [
+          "",
+          "Subagent models (first = default; pass via subagent's model/thinking params):",
+          ...allowlist.map((m, i) => `  ${i === 0 ? "*" : "-"} ${m}`),
+        ];
+
         return {
-          content: [{ type: "text", text: lines.join("\n") }],
-          details: { agents: list },
+          content: [{ type: "text", text: [...lines, ...allowlistLines].join("\n") }],
+          details: { agents: list, models: allowlist },
         };
       },
 
@@ -2346,6 +2399,125 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       const displayName = agentName[0].toUpperCase() + agentName.slice(1);
       const toolCall = `Use subagent with agent: "${agentName}", name: "${displayName}", task: ${JSON.stringify(taskText)}`;
       pi.sendUserMessage(toolCall);
+    },
+  });
+
+  // /subagent-models command — manage the subagent model allowlist
+  pi.registerCommand("subagent-models", {
+    description: "Manage subagent models: /subagent-models add|remove|list [provider/id]",
+    getArgumentCompletions: (argumentText: string) => {
+      const trimmed = argumentText.trim();
+      const spaceIdx = trimmed.indexOf(" ");
+      const sub = spaceIdx === -1 ? trimmed : trimmed.slice(0, spaceIdx);
+
+      // Complete the subcommand while it's still being typed.
+      if (!("add" === sub || "remove" === sub || "list" === sub)) {
+        const items = ["add", "remove", "list"]
+          .filter((s) => (sub ? s.startsWith(sub.toLowerCase()) : true))
+          .map((s) => ({ value: s, label: s }));
+        return items.length > 0 ? items : null;
+      }
+
+      if (sub === "list") return null; // takes no argument
+
+      // Complete the model argument. The editor replaces the whole argument
+      // text with item.value, so values are prefixed with the subcommand.
+      const partial = (spaceIdx === -1 ? "" : trimmed.slice(spaceIdx + 1)).toLowerCase();
+      const registry = (latestCtx as any)?.modelRegistry as
+        | { getAvailable(): Array<{ provider: string; id: string }> }
+        | undefined;
+      let candidates: string[];
+      if (sub === "add") {
+        const allowlist = new Set(readModelAllowlist());
+        candidates = registry
+          ? registry
+              .getAvailable()
+              .map((m) => `${m.provider}/${m.id}`)
+              .filter((m) => !allowlist.has(m))
+          : [];
+      } else {
+        candidates = readModelAllowlist();
+      }
+      const filtered = candidates.filter((m) => m.toLowerCase().includes(partial));
+      if (filtered.length === 0) return null;
+      return filtered.map((m) => ({
+        value: `${sub} ${m}`,
+        label: m,
+        description: sub === "add" ? "add to subagent allowlist" : "remove from subagent allowlist",
+      }));
+    },
+    handler: async (args, ctx) => {
+      const trimmed = args.trim();
+      if (!trimmed) {
+        ctx.ui.notify("Usage: /subagent-models add|remove|list [provider/id]", "warning");
+        return;
+      }
+      const spaceIdx = trimmed.indexOf(" ");
+      const sub = spaceIdx === -1 ? trimmed : trimmed.slice(0, spaceIdx);
+      const rest = spaceIdx === -1 ? "" : trimmed.slice(spaceIdx + 1).trim();
+
+      if (sub === "list") {
+        const models = readModelAllowlist();
+        const lines = models.map(
+          (m, i) => `  ${i === 0 ? "*" : "-"} ${m}${i === 0 ? "  (default)" : ""}`,
+        );
+        ctx.ui.notify(
+          `Subagent models (first = default):\n${lines.join("\n")}\n\nList file: ${getModelAllowlistPath()}`,
+          "info",
+        );
+        return;
+      }
+
+      if (sub !== "add" && sub !== "remove") {
+        ctx.ui.notify("Usage: /subagent-models add|remove|list [provider/id]", "warning");
+        return;
+      }
+      if (!rest) {
+        ctx.ui.notify(`Usage: /subagent-models ${sub} <provider/id>`, "warning");
+        return;
+      }
+
+      const registry = (latestCtx as any)?.modelRegistry as
+        | { find(provider: string, id: string): unknown; getAvailable(): Array<{ provider: string; id: string }> }
+        | undefined;
+
+      if (sub === "add") {
+        // Validate against the live provider catalog — same source as the
+        // /model picker — before allowing the entry.
+        const parsed = parseModelEntry(rest);
+        if (registry && parsed && !registry.find(parsed.provider, parsed.id)) {
+          const partial = parsed.id.toLowerCase();
+          const suggestions = registry
+            .getAvailable()
+            .map((m) => `${m.provider}/${m.id}`)
+            .filter((m) => m.toLowerCase().includes(partial))
+            .slice(0, 5);
+          ctx.ui.notify(
+            `Model "${rest}" was not found in the provider catalog.` +
+              (suggestions.length > 0 ? ` Closest matches:\n  ${suggestions.join("\n  ")}` : ""),
+            "error",
+          );
+          return;
+        }
+        if (readModelAllowlist().includes(rest)) {
+          ctx.ui.notify(`"${rest}" is already in the subagent model allowlist.`, "warning");
+          return;
+        }
+        const result = addModelToAllowlist(rest);
+        if (!result.ok) {
+          ctx.ui.notify(result.error, "error");
+          return;
+        }
+        ctx.ui.notify(`Added "${rest}" to the subagent model allowlist.`, "info");
+        return;
+      }
+
+      const result = removeModelFromAllowlist(rest);
+      if (!result.ok) {
+        ctx.ui.notify(result.error, "error");
+        return;
+      }
+      ctx.ui.notify(`Removed "${rest}". Remaining: ${result.models.join(", ")}`, "info");
     },
   });
 
