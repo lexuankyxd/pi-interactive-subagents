@@ -208,6 +208,8 @@ tmux new -A -s pi 'pi'
 
 Forked from [HazAT/pi-interactive-subagents](https://github.com/HazAT/pi-interactive-subagents), which originated the subagent architecture, the multi-multiplexer surface layer, and the status widget; its supervision features were inspired by [RepoPrompt](https://repoprompt.com/).
 
+And this repo is forked from [amosblomqvist/pi-interactive-subagents](https://github.com/amosblomqvist/pi-interactive-subagents). So forked of a forked type of thing.
+
 ## License
 
 MIT
